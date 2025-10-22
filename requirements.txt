@@ -1,0 +1,6 @@
+flask==3.0.0
+flask-cors==4.0.0
+waitress==3.0.0
+Pillow==10.4.0
+numpy==1.26.4
+pyngrok==7.2.0   # (외부 접근 필요할 때만 사용)
