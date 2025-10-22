@@ -65,6 +65,12 @@ def download(subpath):
     if not os.path.exists(full): abort(404)
     return send_file(full, mimetype="image/png", as_attachment=False)
 
+
+# app.py 상단 라우트들 옆에 추가
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "service": "inkly-colab", "ts": time.time()}
+
 if __name__ == "__main__":
     from waitress import serve
     print("Running on :8000")
