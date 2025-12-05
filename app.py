@@ -1,6 +1,7 @@
 from flask import Flask, request, send_file, jsonify
 from PIL import Image, ImageDraw
 import os, io, time, random
+import mathplotlib
 
 from parsingmodule import parse_to_char_images
 from generatemodule import generate_from_chars
