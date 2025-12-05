@@ -13,6 +13,7 @@ except Exception:
     TARGET_TEXT = "동해물과백두산이마르고닳도록"  # fallback
 
 BASE_DIR = os.path.dirname(__file__)
+RESULT_DIR = BASE_DIR
 
 def _char_order_key(path: str) -> int:
     """

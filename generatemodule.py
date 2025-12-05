@@ -12,14 +12,15 @@ from torchvision import transforms
 # 0. 전역 설정
 # ============================================================
 
-TARGET_TEXT = "동해물과백두산이마르고닳도록"   # 14글자
+# TARGET_TEXT = "동해물과백두산이마르고닳도록"   # 14글자
 IMG_SIZE = 64                                   # 모델 인풋 해상도
 
 BASE_DIR = os.path.dirname(__file__)
+CHARSET_TXT = os.path.join(BASE_DIR, "charset.txt")
 
 # 체크포인트 / 폰트 이미지 경로 (폴더 구조에 따라 수정 가능)
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
-MODEL_PATH = os.path.join(CHECKPOINT_DIR, "model_epoch_380_ema.pt")   # ★ 네가 말한 모델
+MODEL_PATH = os.path.join(CHECKPOINT_DIR, "model_epoch_70_ema.pt")   # ★ 네가 말한 모델
 STYLE_ENCODER_PATH = os.path.join(CHECKPOINT_DIR, "style_encoder.pt") # style encoder
 
 GOTHIC_FONT_NAME = "NanumGothic"
@@ -32,6 +33,23 @@ _UNET = None
 _STYLE_ENCODER = None
 _DIFFUSION = None
 
+
+def load_chars_from_txt(path):
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    raw = raw.replace("\n", "").replace("\r", "").replace(" ", "")
+    seen = set()
+    chars = []
+    for ch in raw:
+        if ch not in seen:
+            seen.add(ch)
+            chars.append(ch)
+    return chars
+
+FULL_CHARS = load_chars_from_txt(CHARSET_TXT)
+CHAR2IDX = {ch: i for i, ch in enumerate(FULL_CHARS)}
+
+TARGET_TEXT = "동해물과백두산이마르고닳도록"  # 여긴 그대로, '동해물..'만 써먹을거야
 
 # ============================================================
 # 1. 전처리 함수 (preprocess_char_pil)
@@ -75,6 +93,47 @@ def preprocess_char_pil(img_pil, img_size=64, margin_ratio=0.10, binarize=True, 
 
     # 최종 리사이즈
     return square.resize((img_size, img_size), Image.LANCZOS)
+
+
+def brighten_background(x, thr=0.8):
+    """
+    x : (B,1,H,W), [-1,1] 범위 텐서 (DDPM 결과)
+    thr : [0,1] 기준 임계값
+          - x01 >= thr 인 픽셀은 전부 1.0(흰색)으로 올림
+          - 나머지는 원래 값 유지
+    """
+    # [-1,1] -> [0,1]
+    x01 = (x + 1.0) / 2.0  # (B,1,H,W)
+
+    # 밝은 픽셀 마스크 (배경 후보)
+    mask = (x01 >= thr).float()
+
+    # 밝은 곳은 1.0, 나머지는 그대로
+    x01_clean = x01 * (1.0 - mask) + mask * 1.0
+
+    return x01_clean   # [0,1] 범위 반환
+
+
+def brighten_and_upscale(x, thr=0.7, scale=4):
+    """
+    x : (B,1,H,W), [-1,1]
+    반환: (B, H*scale, W*scale)  numpy 배열 (0~1)
+    """
+    x01 = brighten_background(x, thr=thr)  # [0,1]
+
+    imgs = []
+    for i in range(x01.size(0)):
+        arr = x01[i, 0].detach().cpu().numpy()   # (H,W), 0~1
+        pil = Image.fromarray((arr * 255).astype(np.uint8))
+        up = pil.resize(
+            (pil.width * scale, pil.height * scale),
+            Image.BILINEAR
+        )
+        up_arr = np.asarray(up).astype(np.float32) / 255.0
+        imgs.append(up_arr)
+
+    # (B, H', W') numpy 리스트
+    return imgs
 
 
 # ============================================================
@@ -283,7 +342,7 @@ class UNet(nn.Module):
 
 class DiffusionModel:
     """DDPM with Cosine Schedule (모든 텐서를 같은 device에서 생성)"""
-    def __init__(self, timesteps=3000, beta_start=0.0001, beta_end=0.02, device="cpu"):
+    def __init__(self, timesteps=1000, beta_start=0.0001, beta_end=0.02, device="cpu"):
         self.timesteps = timesteps
         # 여기: device가 torch.device든 문자열이든 그냥 통일
         self.device = device if isinstance(device, torch.device) else torch.device(device)
@@ -342,7 +401,7 @@ def noise_blending_interpolation(
     char_idx,
     diffusion,
     device,
-    lambda_val=0.5,
+    lambda_val=0.6,
     guid_hand_early=6.5,
     guid_goth_late=6.0,
     guid_hand_late=2.5,
@@ -430,7 +489,8 @@ def _load_models():
         num_res_blocks=2,
         time_emb_dim=256,
         style_dim=512,
-        num_chars=len(TARGET_TEXT)
+        # num_chars=len(TARGET_TEXT)
+        num_chars=len(FULL_CHARS)
     ).to(DEVICE)
 
     if os.path.exists(MODEL_PATH):
@@ -447,7 +507,7 @@ def _load_models():
         unet.load_state_dict(state, strict=True)
     unet.eval()
 
-    diffusion = DiffusionModel(timesteps=3000, device=DEVICE)
+    diffusion = DiffusionModel(timesteps=1000, device=DEVICE)
 
     _UNET = unet
     _STYLE_ENCODER = style_encoder
@@ -459,28 +519,10 @@ def _load_models():
 # ============================================================
 def generate_from_chars(char_files, out_dir, job_id: str, size=(256, 256)):
     """
-    입력:
-      - char_files: 파싱에서 만든 손글씨 파일 이름 리스트
-                    (out_dir = result{jobId}/handwriting 에 존재한다고 가정)
-      - out_dir   : 손글씨 폴더(result{jobId}/handwriting) 경로
-      - job_id    : 업로드 ID
-
-    동작:
-      - TARGET_TEXT("동해물과백두산이마르고닳도록") 순서대로
-        char_files[i] 를 i번째 글자에 매칭해서 diffusion 추론으로 개선된 글자 생성
-      - 개선된 글자는 result{jobId}/generation 에
-        {job_id}_generated_c{i}.png 로 저장
-      - 이들을 가로로 이어 붙인 대표 이미지
-        {job_id}_generated.png 를 같은 generation 폴더에 생성
-
-    반환:
-      - dict(representative=<파일명>, partials=<list[파일명]>)
-        (파일명은 모두 generation 폴더 기준)
+    ...
     """
-    # out_dir는 "handwriting" 폴더라고 가정
     handwriting_dir = out_dir
 
-    # result{jobId}/handwriting → result{jobId}/generation
     result_root = os.path.dirname(handwriting_dir.rstrip(os.sep))
     gen_dir = os.path.join(result_root, "generation")
     os.makedirs(gen_dir, exist_ok=True)
@@ -488,7 +530,6 @@ def generate_from_chars(char_files, out_dir, job_id: str, size=(256, 256)):
     _load_models()
 
     # ---------- size 처리 ----------
-    # size=None이면, 손글씨 이미지 하나를 열어서 그 크기를 사용
     if size is None:
         W = H = None
         for fname in char_files:
@@ -506,22 +547,18 @@ def generate_from_chars(char_files, out_dir, job_id: str, size=(256, 256)):
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5])  # [0,1] -> [-1,1]
     ])
-
     partials = []
-
-    # 사용할 글자 수: 파싱된 이미지 수와 TARGET_TEXT 길이 중 최소
     num_chars = min(len(char_files), len(TARGET_TEXT))
 
     for i in range(num_chars):
-        char = TARGET_TEXT[i]
+        char = TARGET_TEXT[i]               # '동', '해', ...
         src_fname = char_files[i]
         src_path = os.path.join(handwriting_dir, src_fname)
 
         if not os.path.exists(src_path):
-            # 해당 파일이 없으면 스킵
             continue
 
-        # 1) 손글씨 이미지 로드 & 전처리
+        # 1) 손글씨 전처리
         hw_raw = Image.open(src_path).convert("L")
         hw_proc = preprocess_char_pil(
             hw_raw,
@@ -532,7 +569,7 @@ def generate_from_chars(char_files, out_dir, job_id: str, size=(256, 256)):
         )
         hw_tensor = transform(hw_proc).unsqueeze(0).to(DEVICE)
 
-        # 2) 고딕 reference 이미지 (미존재 시 손글씨 그대로 사용)
+        # 2) 고딕 reference
         goth_path = os.path.join(FONT_IMAGES_DIR, f"{ord(char)}.png")
         if os.path.exists(goth_path):
             goth_raw = Image.open(goth_path).convert("L")
@@ -546,8 +583,14 @@ def generate_from_chars(char_files, out_dir, job_id: str, size=(256, 256)):
         else:
             goth_tensor = hw_tensor.clone()
 
-        # 3) diffusion inference (noise blending)
-        char_idx = i  # TARGET_TEXT에서의 index
+        # 3) Noise Blending
+        try:
+            # 🔴 fsid.py 와 동일하게, charset.txt 기준 인덱스 사용
+            char_idx = CHAR2IDX[char]
+        except KeyError:
+            # charset.txt 에 없는 글자면 걍 0번으로 fallback (또는 continue 해도 됨)
+            char_idx = 0
+
         with torch.no_grad():
             result_tensor = noise_blending_interpolation(
                 _UNET,
@@ -557,40 +600,100 @@ def generate_from_chars(char_files, out_dir, job_id: str, size=(256, 256)):
                 char_idx,
                 _DIFFUSION,
                 DEVICE,
-                lambda_val=0.5,     # 보간 비율
-                sampling_stride=4,  # 추론 속도용
+                lambda_val=0.6,
+                sampling_stride=1,
+                variance_scale=0.0,
             )
 
-        # 4) 텐서를 PIL 이미지로 변환 후 리사이즈 & 저장 (→ generation 폴더)
-        res = result_tensor[0, 0].cpu()
-        res = (res + 1) / 2.0        # [-1,1] -> [0,1]
-        res = res.clamp(0.0, 1.0)
-        res_img = transforms.ToPILImage()(res.unsqueeze(0))
-        res_img = res_img.resize((W, H), Image.LANCZOS).convert("RGB")
+            x01 = brighten_background(result_tensor, thr=0.8)   # (B,1,H,W), [0,1]
+            arr = (x01[0, 0].cpu().numpy() * 255).astype(np.uint8)
+            res_img = Image.fromarray(arr, mode="L").convert("RGB")
+
+        if res_img.size != (W, H):
+            res_img = res_img.resize((W, H), Image.LANCZOS)
 
         out_name = f"{job_id}_generated_c{i+1}.png"
         out_path = os.path.join(gen_dir, out_name)
         res_img.save(out_path, format="PNG")
         partials.append(out_name)
 
-    # 5) representative 이미지: partial들을 가로로 이어붙이기 (→ generation 폴더)
+    # # 5) representative 이어붙이기
+    # if len(partials) > 0:
+    #     rep_width = W * len(partials)
+    #     rep_height = H
+    #     rep = Image.new("RGB", (rep_width, rep_height), "white")
+
+    #     for idx, fname in enumerate(partials):
+    #         p_path = os.path.join(gen_dir, fname)
+    #         glyph_img = Image.open(p_path).convert("RGB")
+    #         glyph_img = glyph_img.resize((W, H), Image.LANCZOS)
+    #         rep.paste(glyph_img, (idx * W, 0))
+
+    #     rep_name = f"{job_id}_generated_c1.png"
+    #     rep.save(os.path.join(gen_dir, rep_name), format="PNG")
+    # else:
+    #     rep = Image.new("RGB", (W, H), "white")
+    #     draw = ImageDraw.Draw(rep)
+    #     try:
+    #         font = ImageFont.truetype("DejaVuSans.ttf", 72)
+    #     except Exception:
+    #         font = ImageFont.load_default()
+    #     text = "result"
+    #     bbox = draw.textbbox((0, 0), text, font=font)
+    #     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    #     draw.text(((W - tw) // 2, (H - th) // 2), text, fill="black", font=font)
+    #     rep_name = f"{job_id}_generated_c1.png"
+    #     rep.save(os.path.join(gen_dir, rep_name), format="PNG")
+
+    # return {"representative": rep_name, "partials": partials}
+    #시연용
+        # 5) 대표 이미지: 원본 동 + 개선된 동 나란히 비교
     if len(partials) > 0:
-        rep_width = W * len(partials)
+        original_path = os.path.join(handwriting_dir, char_files[0])
+        try:
+            # 1) 원본 불러와서
+            orig_raw = Image.open(original_path).convert("L")
+            # 2) 모델에 넣는 것과 동일한 전처리 적용
+            orig_proc = preprocess_char_pil(
+                orig_raw,
+                img_size=IMG_SIZE,
+                margin_ratio=0.10,
+                binarize=True,
+                thr=220,
+            )
+            # 3) 최종 프리뷰 크기로 리사이즈 후 RGB 변환
+            if orig_proc.size != (W, H):
+                orig_proc = orig_proc.resize((W, H), Image.LANCZOS)
+            orig_img = orig_proc.convert("RGB")
+        except Exception:
+            orig_img = Image.new("RGB", (W, H), "white")
+
+        # 2) 개선된 동 (첫 번째 생성 결과 partials[0])
+        gen_path = os.path.join(gen_dir, partials[0])
+        try:
+            gen_img = Image.open(gen_path).convert("RGB")
+        except Exception:
+            gen_img = Image.new("RGB", (W, H), "white")
+
+        if gen_img.size != (W, H):
+            gen_img = gen_img.resize((W, H), Image.LANCZOS)
+
+        # 3) 두 이미지를 가로로 이어붙인 비교 이미지
+        rep_width = W * 2
         rep_height = H
         rep = Image.new("RGB", (rep_width, rep_height), "white")
+        # 왼쪽: 원본 손글씨 동
+        rep.paste(orig_img, (0, 0))
+        # 오른쪽: 개선된 동
+        rep.paste(gen_img, (W, 0))
 
-        for idx, fname in enumerate(partials):
-            p_path = os.path.join(gen_dir, fname)
-            glyph_img = Image.open(p_path).convert("RGB")
-            glyph_img = glyph_img.resize((W, H), Image.LANCZOS)
-            rep.paste(glyph_img, (idx * W, 0))
-
-        rep_name = f"{job_id}_generated.png"
-        rep_path = os.path.join(gen_dir, rep_name)
-        rep.save(rep_path, format="PNG")
+        rep_name = f"{job_id}_compare.png"
+        rep.save(os.path.join(gen_dir, rep_name), format="PNG")
     else:
-        # 만약 partial이 하나도 없으면, fallback: "result" placeholder
-        rep = Image.new("RGB", (W, H), "white")
+        # 생성 결과가 하나도 없는 예외 상황
+        rep_width = W * 2
+        rep_height = H
+        rep = Image.new("RGB", (rep_width, rep_height), "white")
         draw = ImageDraw.Draw(rep)
         try:
             font = ImageFont.truetype("DejaVuSans.ttf", 72)
@@ -599,8 +702,8 @@ def generate_from_chars(char_files, out_dir, job_id: str, size=(256, 256)):
         text = "result"
         bbox = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((W - tw) // 2, (H - th) // 2), text, fill="black", font=font)
-        rep_name = f"{job_id}_generated.png"
+        draw.text(((rep_width - tw) // 2, (rep_height - th) // 2),
+                  text, fill="black", font=font)
+        rep_name = f"{job_id}_compare.png"
         rep.save(os.path.join(gen_dir, rep_name), format="PNG")
-
     return {"representative": rep_name, "partials": partials}
