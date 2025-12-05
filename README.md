@@ -2,6 +2,7 @@
 # Inkly Model Server (Colab)
 
 AI handwriting style transfer server running on Google Colab + Cloudflare Tunnel.
+**checkpoints 폴더에 model을 upload해야 합니다.
 
 ## Features
 - Grid-based handwriting segmentation
