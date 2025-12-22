@@ -1,40 +1,57 @@
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+# generatemodule.py
+from __future__ import annotations
+
 import os
 import math
 import numpy as np
+from PIL import Image, ImageFilter
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import transforms
 
 # ============================================================
-# 0. 전역 설정
+# 0. Global config
 # ============================================================
 
-# TARGET_TEXT = "동해물과백두산이마르고닳도록"   # 14글자
-IMG_SIZE = 64                                   # 모델 인풋 해상도
+IMG_SIZE = 64
+TARGET_TEXT = "동해물과백두산이마르고닳도록"  # 14 chars
 
-BASE_DIR = os.path.dirname(__file__)
+try:
+    BASE_DIR = os.path.dirname(__file__)
+except NameError:
+    BASE_DIR = os.getcwd()
+
 CHARSET_TXT = os.path.join(BASE_DIR, "charset.txt")
 
-# 체크포인트 / 폰트 이미지 경로 (폴더 구조에 따라 수정 가능)
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
-MODEL_PATH = os.path.join(CHECKPOINT_DIR, "model_epoch_70_ema.pt")   # ★ 네가 말한 모델
-STYLE_ENCODER_PATH = os.path.join(CHECKPOINT_DIR, "style_encoder.pt") # style encoder
+MODEL_PATH = os.path.join(CHECKPOINT_DIR, "model_epoch_100_ema.pt")
+STYLE_ENCODER_PATH = os.path.join(CHECKPOINT_DIR, "style_encoder.pt")
 
 GOTHIC_FONT_NAME = "NanumGothic"
 FONT_IMAGES_DIR = os.path.join(BASE_DIR, "font_images", GOTHIC_FONT_NAME)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# lazy loading용 전역 변수
 _UNET = None
 _STYLE_ENCODER = None
 _DIFFUSION = None
 
+# ============================================================
+# 1) Charset (char -> index)
+# ============================================================
 
-def load_chars_from_txt(path):
+def _load_chars_from_txt(path: str):
+    if not os.path.exists(path):
+        # fallback: TARGET_TEXT unique chars
+        seen = set()
+        chars = []
+        for ch in TARGET_TEXT:
+            if ch not in seen:
+                seen.add(ch)
+                chars.append(ch)
+        return chars
+
     with open(path, "r", encoding="utf-8") as f:
         raw = f.read()
     raw = raw.replace("\n", "").replace("\r", "").replace(" ", "")
@@ -46,38 +63,35 @@ def load_chars_from_txt(path):
             chars.append(ch)
     return chars
 
-FULL_CHARS = load_chars_from_txt(CHARSET_TXT)
+FULL_CHARS = _load_chars_from_txt(CHARSET_TXT)
 CHAR2IDX = {ch: i for i, ch in enumerate(FULL_CHARS)}
 
-TARGET_TEXT = "동해물과백두산이마르고닳도록"  # 여긴 그대로, '동해물..'만 써먹을거야
-
 # ============================================================
-# 1. 전처리 함수 (preprocess_char_pil)
+# 2) Preprocess / Utils
 # ============================================================
 
 def preprocess_char_pil(img_pil, img_size=64, margin_ratio=0.10, binarize=True, thr=220):
     """
-    손글씨/스캔 이미지에도 고딕과 동일하게 크롭-패딩-리사이즈 적용.
-    - 배경이 완전 흰색이 아닐 수 있으니 간단 이진화(thr) 옵션 제공
+    - grayscale
+    - optional binarize(white background)
+    - tight crop by non-white pixels
+    - pad to square
+    - resize to img_size
     """
-    img = img_pil.convert('L').filter(ImageFilter.MedianFilter(size=3))
+    img = img_pil.convert("L").filter(ImageFilter.MedianFilter(size=3))
     arr = np.array(img)
 
     if binarize:
-        # 배경 밝게, 획 어둡게 가정: 임계값으로 배경을 255로 밀어줌
         arr = np.where(arr > thr, 255, arr)
 
-    # 글자 영역 찾기 (흰색이 아닌 곳)
     rows = np.any(arr < 255, axis=1)
     cols = np.any(arr < 255, axis=0)
     if not rows.any() or not cols.any():
-        # 비어있으면 그대로 리사이즈만
         return img.resize((img_size, img_size), Image.LANCZOS)
 
     rmin, rmax = np.where(rows)[0][[0, -1]]
     cmin, cmax = np.where(cols)[0][[0, -1]]
 
-    # 10% 여백
     h, w = arr.shape
     margin = int(max(rmax - rmin, cmax - cmin) * margin_ratio)
     rmin = max(0, rmin - margin); rmax = min(h, rmax + margin)
@@ -85,63 +99,38 @@ def preprocess_char_pil(img_pil, img_size=64, margin_ratio=0.10, binarize=True, 
 
     cropped = Image.fromarray(arr).crop((cmin, rmin, cmax, rmax))
 
-    # 정사각 패딩
     cw, ch = cropped.size
     m = max(cw, ch)
-    square = Image.new('L', (m, m), color=255)
-    square.paste(cropped, ((m - cw)//2, (m - ch)//2))
+    square = Image.new("L", (m, m), color=255)
+    square.paste(cropped, ((m - cw) // 2, (m - ch) // 2))
 
-    # 최종 리사이즈
     return square.resize((img_size, img_size), Image.LANCZOS)
 
-
 def brighten_background(x, thr=0.8):
-    """
-    x : (B,1,H,W), [-1,1] 범위 텐서 (DDPM 결과)
-    thr : [0,1] 기준 임계값
-          - x01 >= thr 인 픽셀은 전부 1.0(흰색)으로 올림
-          - 나머지는 원래 값 유지
-    """
-    # [-1,1] -> [0,1]
-    x01 = (x + 1.0) / 2.0  # (B,1,H,W)
+    # x in [-1,1] -> [0,1]
+    x01 = (x + 1.0) / 2.0
+    mask = (x01 >= thr)
+    return torch.where(mask, torch.ones_like(x01), x01)
 
-    # 밝은 픽셀 마스크 (배경 후보)
-    mask = (x01 >= thr).float()
-
-    # 밝은 곳은 1.0, 나머지는 그대로
-    x01_clean = x01 * (1.0 - mask) + mask * 1.0
-
-    return x01_clean   # [0,1] 범위 반환
-
-
-def brighten_and_upscale(x, thr=0.7, scale=4):
-    """
-    x : (B,1,H,W), [-1,1]
-    반환: (B, H*scale, W*scale)  numpy 배열 (0~1)
-    """
-    x01 = brighten_background(x, thr=thr)  # [0,1]
-
-    imgs = []
-    for i in range(x01.size(0)):
-        arr = x01[i, 0].detach().cpu().numpy()   # (H,W), 0~1
-        pil = Image.fromarray((arr * 255).astype(np.uint8))
-        up = pil.resize(
-            (pil.width * scale, pil.height * scale),
-            Image.BILINEAR
-        )
-        up_arr = np.asarray(up).astype(np.float32) / 255.0
-        imgs.append(up_arr)
-
-    # (B, H', W') numpy 리스트
-    return imgs
-
+def _concat_images_row(img_paths, out_path, cell_size):
+    W, H = cell_size
+    canvas = Image.new("RGB", (W * len(img_paths), H), "white")
+    for i, p in enumerate(img_paths):
+        try:
+            im = Image.open(p).convert("RGB").resize((W, H), Image.LANCZOS)
+        except Exception:
+            im = Image.new("RGB", (W, H), "white")
+        canvas.paste(im, (i * W, 0))
+    canvas.save(out_path, format="PNG")
 
 # ============================================================
-# 2. 모델 정의 (StyleEncoder, UNet, DiffusionModel)
+# 3) Models (UNet + Diffusion)  + StyleEncoder(✅ checkpoint-compatible)
 # ============================================================
 
 class StyleEncoder(nn.Module):
-    # input: 1x64x64 / output: 512-dim style vector
+    """
+    ✅ MUST match checkpoint keys: conv1..conv4, fc.0, fc.0.bias ...
+    """
     def __init__(self, style_dim=512):
         super().__init__()
         self.conv1 = nn.Sequential(
@@ -151,7 +140,7 @@ class StyleEncoder(nn.Module):
             nn.Conv2d(64, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2)  # 64 -> 32
+            nn.MaxPool2d(2)
         )
         self.conv2 = nn.Sequential(
             nn.Conv2d(64, 128, 3, padding=1),
@@ -160,7 +149,7 @@ class StyleEncoder(nn.Module):
             nn.Conv2d(128, 128, 3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2)  # 32 -> 16
+            nn.MaxPool2d(2)
         )
         self.conv3 = nn.Sequential(
             nn.Conv2d(128, 256, 3, padding=1),
@@ -169,7 +158,7 @@ class StyleEncoder(nn.Module):
             nn.Conv2d(256, 256, 3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2)  # 16 -> 8
+            nn.MaxPool2d(2)
         )
         self.conv4 = nn.Sequential(
             nn.Conv2d(256, 512, 3, padding=1),
@@ -180,6 +169,7 @@ class StyleEncoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1)
         )
+        # checkpoint has fc.0.*
         self.fc = nn.Sequential(
             nn.Linear(512, style_dim),
             nn.ReLU(inplace=True)
@@ -191,24 +181,19 @@ class StyleEncoder(nn.Module):
         x = self.conv3(x)
         x = self.conv4(x)
         x = x.view(x.size(0), -1)
-        x = self.fc(x)
-        return x
-
+        return self.fc(x)
 
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-
     def forward(self, time):
         device = time.device
         half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
-
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = time[:, None] * emb[None, :]
+        return torch.cat((emb.sin(), emb.cos()), dim=-1)
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, time_emb_dim, style_dim):
@@ -216,25 +201,22 @@ class ResidualBlock(nn.Module):
         self.conv1 = nn.Sequential(
             nn.GroupNorm(8, in_channels),
             nn.SiLU(),
-            nn.Conv2d(in_channels, out_channels, 3, padding=1)
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
         )
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_emb_dim, out_channels)
+            nn.Linear(time_emb_dim, out_channels),
         )
         self.style_mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(style_dim, out_channels)
+            nn.Linear(style_dim, out_channels),
         )
         self.conv2 = nn.Sequential(
             nn.GroupNorm(8, out_channels),
             nn.SiLU(),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1)
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
         )
-        if in_channels != out_channels:
-            self.shortcut = nn.Conv2d(in_channels, out_channels, 1)
-        else:
-            self.shortcut = nn.Identity()
+        self.shortcut = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x, t_emb, s_emb):
         h = self.conv1(x)
@@ -243,9 +225,8 @@ class ResidualBlock(nn.Module):
         h = self.conv2(h)
         return h + self.shortcut(x)
 
-
 class UNet(nn.Module):
-    def __init__(self, img_channels=1, base_channels=64, channel_mults=(1, 2, 4, 8),
+    def __init__(self, img_channels=1, base_channels=64, channel_mults=(1,2,4,8),
                  num_res_blocks=2, time_emb_dim=256, style_dim=512, num_chars=14):
         super().__init__()
 
@@ -253,8 +234,9 @@ class UNet(nn.Module):
             SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim)
+            nn.Linear(time_emb_dim, time_emb_dim),
         )
+
         self.char_emb = nn.Embedding(num_chars, style_dim)
         self.null_token = nn.Parameter(torch.randn(style_dim))
 
@@ -294,7 +276,7 @@ class UNet(nn.Module):
         self.final_conv = nn.Sequential(
             nn.GroupNorm(8, base_channels),
             nn.SiLU(),
-            nn.Conv2d(base_channels, img_channels, 3, padding=1)
+            nn.Conv2d(base_channels, img_channels, 3, padding=1),
         )
 
     def forward(self, x, t, char_idx, style_emb=None, use_null_token=False):
@@ -339,18 +321,13 @@ class UNet(nn.Module):
 
         return self.final_conv(x)
 
-
 class DiffusionModel:
-    """DDPM with Cosine Schedule (모든 텐서를 같은 device에서 생성)"""
-    def __init__(self, timesteps=1000, beta_start=0.0001, beta_end=0.02, device="cpu"):
+    def __init__(self, timesteps=1000, device=DEVICE):
         self.timesteps = timesteps
-        # 여기: device가 torch.device든 문자열이든 그냥 통일
         self.device = device if isinstance(device, torch.device) else torch.device(device)
 
         steps = timesteps + 1
         s = 0.008
-
-        # 처음부터 device 위에서 생성
         x = torch.linspace(0, timesteps, steps, device=self.device)
         alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
@@ -358,20 +335,10 @@ class DiffusionModel:
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
         betas = torch.clamp(betas, 0.0001, 0.9999)
 
-        # 🔴 여기 세 줄이 중요
-        self.betas = betas.to(self.device)                    # (T,)
-        self.alphas = (1.0 - betas).to(self.device)           # (T,)
-        self.alphas_cumprod = torch.cumprod(
-            self.alphas, dim=0
-        ).to(self.device)                                     # (T,)
-
-        self.alphas_cumprod_prev = torch.cat(
-            [
-                torch.ones(1, device=self.device),
-                self.alphas_cumprod[:-1]
-            ],
-            dim=0,
-        )   # 둘 다 같은 device
+        self.betas = betas
+        self.alphas = 1.0 - betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.alphas_cumprod_prev = torch.cat([torch.ones(1, device=self.device), self.alphas_cumprod[:-1]], dim=0)
 
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
@@ -379,28 +346,26 @@ class DiffusionModel:
         self.posterior_variance = (
             self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         )
-        # 필요하면 여기도 .to(self.device) 붙여도 됨
-        # self.posterior_variance = self.posterior_variance.to(self.device)
 
     def q_sample(self, x_0, t, noise=None):
         if noise is None:
             noise = torch.randn_like(x_0)
+        sqrt_ac = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
+        sqrt_om = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
+        return sqrt_ac * x_0 + sqrt_om * noise
 
-        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
-        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
-        return sqrt_alphas_cumprod_t * x_0 + sqrt_one_minus_alphas_cumprod_t * noise
 # ============================================================
-# 3. Noise-blending interpolation (inference)
+# 4) Batch parallel sampling (noise blending)
 # ============================================================
 
-def noise_blending_interpolation(
-    model,
-    style_encoder,
-    handwriting_img,
-    gothic_img,
-    char_idx,
-    diffusion,
-    device,
+def noise_blending_interpolation_batch(
+    model: UNet,
+    style_encoder: StyleEncoder,
+    handwriting_img: torch.Tensor,   # (B,1,H,W)
+    gothic_img: torch.Tensor,        # (B,1,H,W)
+    char_idx: torch.Tensor,          # (B,)
+    diffusion: DiffusionModel,
+    device: torch.device,
     lambda_val=0.6,
     guid_hand_early=6.5,
     guid_goth_late=6.0,
@@ -408,28 +373,25 @@ def noise_blending_interpolation(
     guid_goth_early=3.0,
     ramp_power=2.5,
     t_start_frac=0.6,
-    variance_scale=0.8,
+    variance_scale=0.0,
     sampling_stride=1,
 ):
-    """
-    - 초반(t가 큼): 손글씨 비중 / 후반(t가 작): 고딕 비중
-    - t_start에서 image-to-image 시작
-    """
     model.eval()
     with torch.no_grad():
-        style_hand = style_encoder(handwriting_img)
-        style_goth = style_encoder(gothic_img)
-        char_idx_tensor = torch.tensor([char_idx], device=device)
+        B = handwriting_img.size(0)
+
+        style_hand = style_encoder(handwriting_img)  # (B,512)
+        style_goth = style_encoder(gothic_img)       # (B,512)
 
         T = diffusion.timesteps
         t_start = int(max(1, min(T - 1, round(t_start_frac * (T - 1)))))
 
         noise = torch.randn_like(handwriting_img)
-        t0 = torch.full((handwriting_img.size(0),), t_start, device=device, dtype=torch.long)
+        t0 = torch.full((B,), t_start, device=device, dtype=torch.long)
         x_t = diffusion.q_sample(handwriting_img, t0, noise=noise)
 
         for t in range(t_start, -1, -sampling_stride):
-            t_tensor = torch.tensor([t], device=device)
+            t_tensor = torch.full((B,), t, device=device, dtype=torch.long)
 
             progress = t / float(T - 1)
             sched_goth = (1.0 - progress) ** ramp_power
@@ -439,49 +401,71 @@ def noise_blending_interpolation(
             g_hand = guid_hand_early * progress + guid_hand_late * (1.0 - progress)
             g_goth = guid_goth_early * progress + guid_goth_late * (1.0 - progress)
 
-            hand_c = model(x_t, t_tensor, char_idx_tensor, style_hand, use_null_token=False)
-            hand_u = model(x_t, t_tensor, char_idx_tensor, None,       use_null_token=True)
-            goth_c = model(x_t, t_tensor, char_idx_tensor, style_goth, use_null_token=False)
-            goth_u = model(x_t, t_tensor, char_idx_tensor, None,       use_null_token=True)
+            hand_c = model(x_t, t_tensor, char_idx, style_hand, use_null_token=False)
+            hand_u = model(x_t, t_tensor, char_idx, None,       use_null_token=True)
+            goth_c = model(x_t, t_tensor, char_idx, style_goth, use_null_token=False)
+            goth_u = model(x_t, t_tensor, char_idx, None,       use_null_token=True)
 
             noise_hand = hand_u + g_hand * (hand_c - hand_u)
             noise_goth = goth_u + g_goth * (goth_c - goth_u)
             noise_pred = w_hand * noise_hand + w_goth * noise_goth
 
-            beta_t  = diffusion.betas[t].view(-1, 1, 1, 1)
-            sqrt_1m = diffusion.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
-            sqrt_ra = torch.sqrt(1.0 / diffusion.alphas[t]).view(-1, 1, 1, 1)
+            beta_t  = diffusion.betas[t].view(1, 1, 1, 1)
+            sqrt_1m = diffusion.sqrt_one_minus_alphas_cumprod[t].view(1, 1, 1, 1)
+            sqrt_ra = torch.sqrt(1.0 / diffusion.alphas[t]).view(1, 1, 1, 1)
 
             model_mean = sqrt_ra * (x_t - beta_t * noise_pred / sqrt_1m)
             model_mean = torch.clamp(model_mean, -1.0, 1.0)
 
             if t > 0:
-                var = diffusion.posterior_variance[t].view(-1, 1, 1, 1)
+                var = diffusion.posterior_variance[t].view(1, 1, 1, 1)
                 x_t = model_mean + torch.sqrt(var * variance_scale) * torch.randn_like(x_t)
             else:
                 x_t = model_mean
 
         return x_t
 
+# ============================================================
+# 5) Load checkpoints (robust)
+# ============================================================
 
-# ============================================================
-# 4. 모델 로더 (lazy load)
-# ============================================================
+def _strip_module_prefix(state: dict) -> dict:
+    return {k.replace("module.", ""): v for k, v in state.items()}
+
+def _pick_state_dict(obj):
+    """
+    handle:
+      - raw state_dict
+      - {"state_dict": ...}
+      - {"model_state_dict": ...}
+      - {"model_ema": ...}
+    """
+    if not isinstance(obj, dict):
+        return obj
+    if "model_ema" in obj and isinstance(obj["model_ema"], dict):
+        return obj["model_ema"]
+    if "model_state_dict" in obj and isinstance(obj["model_state_dict"], dict):
+        return obj["model_state_dict"]
+    if "state_dict" in obj and isinstance(obj["state_dict"], dict):
+        return obj["state_dict"]
+    return obj
 
 def _load_models():
     global _UNET, _STYLE_ENCODER, _DIFFUSION
-
     if _UNET is not None and _STYLE_ENCODER is not None and _DIFFUSION is not None:
         return
 
-    # Style Encoder
-    style_encoder = StyleEncoder(style_dim=512).to(DEVICE)
+    # ---- Style encoder ----
+    se = StyleEncoder(style_dim=512).to(DEVICE)
     if os.path.exists(STYLE_ENCODER_PATH):
-        ckpt_se = torch.load(STYLE_ENCODER_PATH, map_location=DEVICE)
-        style_encoder.load_state_dict(ckpt_se)
-    style_encoder.eval()
+        ckpt = torch.load(STYLE_ENCODER_PATH, map_location=DEVICE)
+        state = _pick_state_dict(ckpt)
+        if isinstance(state, dict):
+            state = _strip_module_prefix(state)
+        se.load_state_dict(state, strict=True)
+    se.eval()
 
-    # U-Net
+    # ---- UNet ----
     unet = UNet(
         img_channels=1,
         base_channels=64,
@@ -489,221 +473,144 @@ def _load_models():
         num_res_blocks=2,
         time_emb_dim=256,
         style_dim=512,
-        # num_chars=len(TARGET_TEXT)
-        num_chars=len(FULL_CHARS)
+        num_chars=len(FULL_CHARS),
     ).to(DEVICE)
 
     if os.path.exists(MODEL_PATH):
         ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
-        if isinstance(ckpt, dict):
-            if "model_ema" in ckpt:
-                state = ckpt["model_ema"]
-            elif "model_state_dict" in ckpt:
-                state = ckpt["model_state_dict"]
-            else:
-                state = ckpt
-        else:
-            state = ckpt
+        state = _pick_state_dict(ckpt)
+        if isinstance(state, dict):
+            state = _strip_module_prefix(state)
         unet.load_state_dict(state, strict=True)
     unet.eval()
 
     diffusion = DiffusionModel(timesteps=1000, device=DEVICE)
 
+    _STYLE_ENCODER = se
     _UNET = unet
-    _STYLE_ENCODER = style_encoder
     _DIFFUSION = diffusion
 
+# ============================================================
+# 6) Main API
+# ============================================================
 
-# ============================================================
-# 5. 메인 API 함수: generate_from_chars
-# ============================================================
 def generate_from_chars(char_files, out_dir, job_id: str, size=(256, 256)):
     """
-    ...
-    """
-    handwriting_dir = out_dir
+    INPUT (expected):
+      result{jobId}/handwriting/0.png ~ 13.png
 
+    OUTPUT:
+      result{jobId}/generation/0.png ~ 13.png (always)
+      + 2 representative images:
+        - {jobId}_handwriting_concat.png
+        - {jobId}_generated_concat.png
+
+    RETURN:
+      representative (generated concat)
+      representative_original (handwriting concat)
+      handwriting (list of relative paths)
+      generated (list of relative paths)
+    """
+    _load_models()
+
+    handwriting_dir = out_dir
     result_root = os.path.dirname(handwriting_dir.rstrip(os.sep))
     gen_dir = os.path.join(result_root, "generation")
     os.makedirs(gen_dir, exist_ok=True)
 
-    _load_models()
+    W, H = size if size is not None else (256, 256)
 
-    # ---------- size 처리 ----------
-    if size is None:
-        W = H = None
-        for fname in char_files:
-            src_path = os.path.join(handwriting_dir, fname)
-            if os.path.exists(src_path):
-                with Image.open(src_path) as im:
-                    W, H = im.size
-                break
-        if W is None or H is None:
-            W, H = 256, 256
-    else:
-        W, H = size
-    # ------------------------------
-    transform = transforms.Compose([
+    tf = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5])  # [0,1] -> [-1,1]
     ])
-    partials = []
-    num_chars = min(len(char_files), len(TARGET_TEXT))
 
-    for i in range(num_chars):
-        char = TARGET_TEXT[i]               # '동', '해', ...
-        src_fname = char_files[i]
-        src_path = os.path.join(handwriting_dir, src_fname)
+    # --- load batches (always 14, missing -> blank white) ---
+    hw_tensors = []
+    goth_tensors = []
+    char_indices = []
+    hw_paths = []
+    gen_paths = []
 
-        if not os.path.exists(src_path):
-            continue
+    for i, ch in enumerate(TARGET_TEXT):
+        # handwriting path (0.png..13.png)
+        hw_path = os.path.join(handwriting_dir, f"{i}.png")
+        if os.path.exists(hw_path):
+            hw_raw = Image.open(hw_path).convert("L")
+            hw_proc = preprocess_char_pil(hw_raw, IMG_SIZE, 0.10, True, 220)
+        else:
+            # blank fallback
+            hw_proc = Image.new("L", (IMG_SIZE, IMG_SIZE), 255)
 
-        # 1) 손글씨 전처리
-        hw_raw = Image.open(src_path).convert("L")
-        hw_proc = preprocess_char_pil(
-            hw_raw,
-            img_size=IMG_SIZE,
-            margin_ratio=0.10,
-            binarize=True,
-            thr=220
-        )
-        hw_tensor = transform(hw_proc).unsqueeze(0).to(DEVICE)
+        hw_tensors.append(tf(hw_proc))
+        hw_paths.append(hw_path if os.path.exists(hw_path) else None)
 
-        # 2) 고딕 reference
-        goth_path = os.path.join(FONT_IMAGES_DIR, f"{ord(char)}.png")
+        # gothic reference (unicode png)
+        goth_path = os.path.join(FONT_IMAGES_DIR, f"{ord(ch)}.png")
         if os.path.exists(goth_path):
             goth_raw = Image.open(goth_path).convert("L")
-            goth_proc = preprocess_char_pil(
-                goth_raw,
-                img_size=IMG_SIZE,
-                margin_ratio=0.10,
-                binarize=False
-            )
-            goth_tensor = transform(goth_proc).unsqueeze(0).to(DEVICE)
+            goth_proc = preprocess_char_pil(goth_raw, IMG_SIZE, 0.10, False, 220)
         else:
-            goth_tensor = hw_tensor.clone()
+            goth_proc = hw_proc
 
-        # 3) Noise Blending
-        try:
-            # 🔴 fsid.py 와 동일하게, charset.txt 기준 인덱스 사용
-            char_idx = CHAR2IDX[char]
-        except KeyError:
-            # charset.txt 에 없는 글자면 걍 0번으로 fallback (또는 continue 해도 됨)
-            char_idx = 0
+        goth_tensors.append(tf(goth_proc))
+        char_indices.append(CHAR2IDX.get(ch, 0))
 
-        with torch.no_grad():
-            result_tensor = noise_blending_interpolation(
-                _UNET,
-                _STYLE_ENCODER,
-                hw_tensor,
-                goth_tensor,
-                char_idx,
-                _DIFFUSION,
-                DEVICE,
-                lambda_val=0.6,
-                sampling_stride=1,
-                variance_scale=0.0,
-            )
+    hw_batch = torch.stack(hw_tensors, dim=0).to(DEVICE)         # (14,1,64,64)
+    goth_batch = torch.stack(goth_tensors, dim=0).to(DEVICE)     # (14,1,64,64)
+    char_idx = torch.tensor(char_indices, device=DEVICE, dtype=torch.long)  # (14,)
 
-            x01 = brighten_background(result_tensor, thr=0.8)   # (B,1,H,W), [0,1]
-            arr = (x01[0, 0].cpu().numpy() * 255).astype(np.uint8)
-            res_img = Image.fromarray(arr, mode="L").convert("RGB")
+    with torch.no_grad():
+        result_batch = noise_blending_interpolation_batch(
+            _UNET,
+            _STYLE_ENCODER,
+            hw_batch,
+            goth_batch,
+            char_idx,
+            _DIFFUSION,
+            DEVICE,
+            lambda_val=0.6,
+            sampling_stride=1,
+            variance_scale=0.0,
+        )
+        x01 = brighten_background(result_batch, thr=0.8)  # (14,1,64,64) in [0,1]
 
-        if res_img.size != (W, H):
-            res_img = res_img.resize((W, H), Image.LANCZOS)
+    # --- save generation/0..13.png always ---
+    for i in range(len(TARGET_TEXT)):
+        arr = (x01[i, 0].detach().cpu().numpy() * 255).astype(np.uint8)
+        img = Image.fromarray(arr, mode="L").convert("RGB").resize((W, H), Image.LANCZOS)
+        out_path = os.path.join(gen_dir, f"{i}.png")
+        img.save(out_path, format="PNG")
+        gen_paths.append(out_path)
 
-        out_name = f"{job_id}_generated_c{i+1}.png"
-        out_path = os.path.join(gen_dir, out_name)
-        res_img.save(out_path, format="PNG")
-        partials.append(out_name)
+    # --- 대표 이미지 2개 ---
+    rep_hand = os.path.join(gen_dir, f"{job_id}_handwriting_concat.png")
+    rep_gen  = os.path.join(gen_dir, f"{job_id}_generated_concat.png")
 
-    # # 5) representative 이어붙이기
-    # if len(partials) > 0:
-    #     rep_width = W * len(partials)
-    #     rep_height = H
-    #     rep = Image.new("RGB", (rep_width, rep_height), "white")
+    # handwriting 대표는 실제 파일 없던 칸은 흰이미지로 채움
+    hw_for_concat = []
+    for i in range(len(TARGET_TEXT)):
+        p = os.path.join(handwriting_dir, f"{i}.png")
+        if os.path.exists(p):
+            hw_for_concat.append(p)
+        else:
+            tmp = os.path.join(gen_dir, f"__blank_hw_{i}.png")
+            Image.new("RGB", (W, H), "white").save(tmp, format="PNG")
+            hw_for_concat.append(tmp)
 
-    #     for idx, fname in enumerate(partials):
-    #         p_path = os.path.join(gen_dir, fname)
-    #         glyph_img = Image.open(p_path).convert("RGB")
-    #         glyph_img = glyph_img.resize((W, H), Image.LANCZOS)
-    #         rep.paste(glyph_img, (idx * W, 0))
+    _concat_images_row(hw_for_concat, rep_hand, (W, H))
+    _concat_images_row(gen_paths, rep_gen, (W, H))
 
-    #     rep_name = f"{job_id}_generated_c1.png"
-    #     rep.save(os.path.join(gen_dir, rep_name), format="PNG")
-    # else:
-    #     rep = Image.new("RGB", (W, H), "white")
-    #     draw = ImageDraw.Draw(rep)
-    #     try:
-    #         font = ImageFont.truetype("DejaVuSans.ttf", 72)
-    #     except Exception:
-    #         font = ImageFont.load_default()
-    #     text = "result"
-    #     bbox = draw.textbbox((0, 0), text, font=font)
-    #     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    #     draw.text(((W - tw) // 2, (H - th) // 2), text, fill="black", font=font)
-    #     rep_name = f"{job_id}_generated_c1.png"
-    #     rep.save(os.path.join(gen_dir, rep_name), format="PNG")
+    # --- return relative paths for /download/<path:fname> ---
+    rep_gen_rel  = f"{os.path.basename(rep_gen)}"
+    rep_hand_rel = f"{os.path.basename(rep_hand)}"
 
-    # return {"representative": rep_name, "partials": partials}
-    #시연용
-        # 5) 대표 이미지: 원본 동 + 개선된 동 나란히 비교
-    if len(partials) > 0:
-        original_path = os.path.join(handwriting_dir, char_files[0])
-        try:
-            # 1) 원본 불러와서
-            orig_raw = Image.open(original_path).convert("L")
-            # 2) 모델에 넣는 것과 동일한 전처리 적용
-            orig_proc = preprocess_char_pil(
-                orig_raw,
-                img_size=IMG_SIZE,
-                margin_ratio=0.10,
-                binarize=True,
-                thr=220,
-            )
-            # 3) 최종 프리뷰 크기로 리사이즈 후 RGB 변환
-            if orig_proc.size != (W, H):
-                orig_proc = orig_proc.resize((W, H), Image.LANCZOS)
-            orig_img = orig_proc.convert("RGB")
-        except Exception:
-            orig_img = Image.new("RGB", (W, H), "white")
+    handwriting_rel = [f"result{job_id}/handwriting/{i}.png" for i in range(len(TARGET_TEXT))]
+    generated_rel   = [f"result{job_id}/generation/{i}.png" for i in range(len(TARGET_TEXT))]
 
-        # 2) 개선된 동 (첫 번째 생성 결과 partials[0])
-        gen_path = os.path.join(gen_dir, partials[0])
-        try:
-            gen_img = Image.open(gen_path).convert("RGB")
-        except Exception:
-            gen_img = Image.new("RGB", (W, H), "white")
-
-        if gen_img.size != (W, H):
-            gen_img = gen_img.resize((W, H), Image.LANCZOS)
-
-        # 3) 두 이미지를 가로로 이어붙인 비교 이미지
-        rep_width = W * 2
-        rep_height = H
-        rep = Image.new("RGB", (rep_width, rep_height), "white")
-        # 왼쪽: 원본 손글씨 동
-        rep.paste(orig_img, (0, 0))
-        # 오른쪽: 개선된 동
-        rep.paste(gen_img, (W, 0))
-
-        rep_name = f"{job_id}_compare.png"
-        rep.save(os.path.join(gen_dir, rep_name), format="PNG")
-    else:
-        # 생성 결과가 하나도 없는 예외 상황
-        rep_width = W * 2
-        rep_height = H
-        rep = Image.new("RGB", (rep_width, rep_height), "white")
-        draw = ImageDraw.Draw(rep)
-        try:
-            font = ImageFont.truetype("DejaVuSans.ttf", 72)
-        except Exception:
-            font = ImageFont.load_default()
-        text = "result"
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((rep_width - tw) // 2, (rep_height - th) // 2),
-                  text, fill="black", font=font)
-        rep_name = f"{job_id}_compare.png"
-        rep.save(os.path.join(gen_dir, rep_name), format="PNG")
-    return {"representative": rep_name, "partials": partials}
+    return {
+        "representative": rep_gen_rel,
+        "representative_original": rep_hand_rel,
+        "handwriting": handwriting_rel,
+        "generated": generated_rel,
+    }
